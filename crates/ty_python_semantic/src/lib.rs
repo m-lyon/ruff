@@ -68,6 +68,8 @@ mod subscript;
 mod suppression;
 pub mod types;
 
+pub use types::embed;
+
 mod diagnostic;
 #[cfg(feature = "testing")]
 pub mod pull_types;

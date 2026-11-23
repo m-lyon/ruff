@@ -151,6 +151,7 @@ mod dedicated;
 mod diagnostic;
 mod dict;
 mod display;
+pub mod embed;
 mod enums;
 mod equality;
 mod function;
