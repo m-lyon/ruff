@@ -13,7 +13,7 @@ use ty_python_core::{ProgramFile, place_table, use_def_map};
 use crate::Db;
 use crate::place::imported_symbol;
 use crate::reachability::evaluate_reachability;
-use crate::types::call::bind::{BindingError, CallableBinding};
+use crate::types::call::bind::{Binding, BindingError, CallableBinding};
 use crate::types::call::{Argument, CallArguments, CallError};
 use crate::types::{KnownClass, ProgramEnvironment, Type};
 
@@ -135,6 +135,53 @@ pub fn check_call<'db>(
     callable: Type<'db>,
     args: &[(Arg<'_>, Type<'db>)],
 ) -> CallCheck<'db> {
+    check_call_impl(db, env, callable, args, CallMode::Complete)
+}
+
+/// Checks `args` as the arguments bound by `functools.partial(callable, *args)`, as Hydra binds
+/// them for a `_target_` with `_partial_: true`.
+///
+/// Arguments are checked as by [`check_call`]. Parameters left unbound are not errors, and an
+/// overload that only leaves parameters unbound is not treated as non-matching. The return type
+/// is the `functools.partial` type ty infers for the call. ty only reduces a function's
+/// signature; for a class or other constructor, where ty infers `partial[Unknown]`, it is
+/// `partial[R]` with `R` the type the constructor returns.
+pub fn check_partial_call<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    callable: Type<'db>,
+    args: &[(Arg<'_>, Type<'db>)],
+) -> CallCheck<'db> {
+    let mut check = check_call_impl(db, env, callable, args, CallMode::Partial);
+
+    let partial_class = KnownClass::FunctoolsPartial.to_class_literal(db, env);
+    let partial_args: Vec<_> = std::iter::once((Arg::Positional, callable))
+        .chain(args.iter().copied())
+        .collect();
+    let partial = check_call_impl(db, env, partial_class, &partial_args, CallMode::Complete);
+    let unknown_partial =
+        KnownClass::FunctoolsPartial.to_specialized_instance(db, env, &[Type::unknown()]);
+    check.return_type = if partial.return_type == unknown_partial {
+        KnownClass::FunctoolsPartial.to_specialized_instance(db, env, &[check.return_type])
+    } else {
+        partial.return_type
+    };
+    check
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallMode {
+    Complete,
+    Partial,
+}
+
+fn check_call_impl<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    callable: Type<'db>,
+    args: &[(Arg<'_>, Type<'db>)],
+    mode: CallMode,
+) -> CallCheck<'db> {
     let arguments: CallArguments<'_, 'db> = args
         .iter()
         .map(|(arg, ty)| {
@@ -155,13 +202,33 @@ pub fn check_call<'db>(
         matched_parameters: Vec::new(),
         no_matching_overload: false,
     };
-    bindings.visit_type_context_callables(&mut |binding| collect_binding(binding, &mut check));
+    bindings
+        .visit_type_context_callables(&mut |binding| collect_binding(binding, mode, &mut check));
     check
 }
 
-fn collect_binding<'db>(binding: &CallableBinding<'db>, check: &mut CallCheck<'db>) {
-    let overload = match binding.matching_overloads().next() {
-        Some((_, overload)) => overload,
+fn collect_binding<'db>(
+    binding: &CallableBinding<'db>,
+    mode: CallMode,
+    check: &mut CallCheck<'db>,
+) {
+    // For a partial, an overload whose only errors are unbound parameters still applies. ty does
+    // not check argument types for an overload that fails on arity, so such an overload can
+    // hide a type error; it never adds one.
+    let only_unbound = |overload: &&Binding<'db>| {
+        mode == CallMode::Partial
+            && overload
+                .errors()
+                .iter()
+                .all(|error| matches!(error, BindingError::MissingArguments { .. }))
+    };
+    let matching = binding
+        .matching_overloads()
+        .map(|(_, overload)| overload)
+        .next()
+        .or_else(|| binding.overloads().iter().find(only_unbound));
+    let overload = match matching {
+        Some(overload) => overload,
         None => match binding.overloads() {
             [overload] => overload,
             [] => return,
@@ -555,6 +622,128 @@ def f(x): ...
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].argument_index, 1);
         assert_eq!(display(&db, errors[0].expected), "str");
+    }
+
+    const PARTIALS: &str = "\
+from dataclasses import dataclass
+from typing import Callable, overload
+
+class Model:
+    def __init__(self, width: int, depth: int) -> None: ...
+
+@dataclass
+class Point:
+    x: float
+    y: float
+
+def make_model(width: int, depth: int) -> Model: ...
+def make_point(x: float) -> Point: ...
+
+@overload
+def pick(a: int, b: int) -> int: ...
+@overload
+def pick(a: str, b: str) -> str: ...
+def pick(a, b): ...
+
+def build(factory: Callable[..., Model]) -> Model: ...
+";
+
+    /// The return type and errors of `check_partial_call` on `lib.<name>`.
+    fn partial_call(
+        db: &TestDb,
+        name: &str,
+        args: &[(Arg<'_>, Type<'_>)],
+    ) -> (String, Vec<String>, bool) {
+        let env = db.program_environment();
+        let callable = member(db, "lib", &[name]).expect("callable resolves");
+        let check = check_partial_call(db, &env, callable, args);
+        let errors = check
+            .errors
+            .iter()
+            .map(|error| {
+                format!(
+                    "{}: {}",
+                    error.argument_index,
+                    error.parameter.as_deref().unwrap_or("?")
+                )
+            })
+            .collect();
+        (
+            display(db, check.return_type),
+            errors,
+            check.no_matching_overload,
+        )
+    }
+
+    #[test]
+    fn check_partial_call_on_classes() {
+        let db = db_with(&[("/src/lib.py", PARTIALS)]);
+        let width = [(Arg::Keyword("width"), int_literal(3))];
+        assert_eq!(
+            partial_call(&db, "Model", &width),
+            ("partial[Model]".to_string(), vec![], false)
+        );
+        let x = [(Arg::Keyword("x"), int_literal(1))];
+        assert_eq!(
+            partial_call(&db, "Point", &x),
+            ("partial[Point]".to_string(), vec![], false)
+        );
+
+        let bad = [(Arg::Keyword("width"), str_literal(&db, "wide"))];
+        assert_eq!(partial_call(&db, "Model", &bad).1, ["0: width"]);
+    }
+
+    #[test]
+    fn check_partial_call_on_functions() {
+        let db = db_with(&[("/src/lib.py", PARTIALS)]);
+        let width = [(Arg::Keyword("width"), int_literal(3))];
+        assert_eq!(
+            partial_call(&db, "make_model", &width),
+            (
+                "partial[(*, width: int = 3, depth: int) -> Model]".to_string(),
+                vec![],
+                false
+            )
+        );
+        let bad = [(Arg::Positional, str_literal(&db, "wide"))];
+        assert_eq!(partial_call(&db, "make_model", &bad).1, ["0: width"]);
+
+        // Leaving `b` unbound does not rule out an overload.
+        let a = [(Arg::Positional, int_literal(1))];
+        let (_, errors, no_matching_overload) = partial_call(&db, "pick", &a);
+        assert!(errors.is_empty());
+        assert!(!no_matching_overload);
+    }
+
+    #[test]
+    fn partial_types_are_checked_against_callable_parameters() {
+        let db = db_with(&[("/src/lib.py", PARTIALS)]);
+        let env = db.program_environment();
+        let build = member(&db, "lib", &["build"]).unwrap();
+        let factory = |name: &str, keyword: &str| {
+            let callable = member(&db, "lib", &[name]).unwrap();
+            check_partial_call(
+                &db,
+                &env,
+                callable,
+                &[(Arg::Keyword(keyword), int_literal(1))],
+            )
+            .return_type
+        };
+        let errors = |name: &str, keyword: &str| {
+            check_call(
+                &db,
+                &env,
+                build,
+                &[(Arg::Keyword("factory"), factory(name, keyword))],
+            )
+            .errors
+            .len()
+        };
+        assert_eq!(errors("Model", "width"), 0);
+        assert_eq!(errors("make_model", "width"), 0);
+        assert_eq!(errors("Point", "x"), 1);
+        assert_eq!(errors("make_point", "x"), 1);
     }
 
     /// The names of the reachable definitions of `name` in `scope`, as `kind@line`.
